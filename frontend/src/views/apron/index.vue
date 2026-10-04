@@ -3,7 +3,7 @@
     <header class="page-head">
       <div>
         <h2>机坪安全巡查管理</h2>
-        <p class="page-desc">维护巡查记录，围绕巡查编号、巡查区域、巡查人员、发现问题数做登记、筛选与状态流转。</p>
+        <p class="page-desc">维护巡查记录，围绕巡查编号、巡查区域、巡查人员、发现问题数做登记、筛选与状态流转；演练评估产生的缺项直接进入下方整改清单。</p>
       </div>
       <div class="page-actions">
         <button class="btn primary" type="button" @click="openCreate">登记巡查记录</button>
@@ -16,12 +16,19 @@
         <span class="stat-label">{{ item.label }}</span>
         <strong class="stat-value">{{ item.value }}</strong>
       </article>
+      <article class="stat-card">
+        <span class="stat-label">演练缺项（与应急演练同一份）</span>
+        <strong class="stat-value">{{ sharedDeficiencies.length }}</strong>
+      </article>
     </div>
 
     <p class="status-legend">
       <span v-for="item in statusSummary" :key="item.status" class="legend-item">
         {{ item.status }}：{{ item.count }}
       </span>
+      <span class="legend-item">缺项待整改：{{ rectifySummary['待整改'] }}</span>
+      <span class="legend-item">整改中：{{ rectifySummary['整改中'] }}</span>
+      <span class="legend-item">已复查：{{ rectifySummary['已复查'] }}</span>
     </p>
 
     <form class="filter-bar" @submit.prevent="reload">
@@ -63,8 +70,50 @@
       </tbody>
     </table>
 
+    <section class="rectify-block">
+      <header class="block-head">
+        <h3>整改清单（应急演练缺项同源）</h3>
+        <p class="page-desc">
+          这里读到的缺项条数与「应急演练计划」页是同一份：演练评估提交后落库，重复提交以最新一次为准。
+          整改按 待整改 → 整改中 → 已复查 推进。
+        </p>
+      </header>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>缺项内容</th>
+            <th>来源演练</th>
+            <th>责任岗位</th>
+            <th>整改状态</th>
+            <th>登记时间</th>
+            <th>最近更新</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in sharedDeficiencies" :key="item.id">
+            <td class="cell-wrap">{{ item.content }}</td>
+            <td>{{ item.drillNo }}</td>
+            <td>{{ item.sourcePost }}</td>
+            <td><span class="status-pill" :data-status="item.status">{{ item.status }}</span></td>
+            <td>{{ item.createdAt }}</td>
+            <td>{{ item.updatedAt }}</td>
+            <td class="row-actions">
+              <button v-if="item.status !== '已复查'" class="link" type="button" @click="advance(item.id)">
+                {{ item.status === '待整改' ? '开始整改' : '确认复查' }}
+              </button>
+              <span v-else class="muted-text">已闭环</span>
+            </td>
+          </tr>
+          <tr v-if="!sharedDeficiencies.length">
+            <td colspan="7" class="empty-state">暂无演练缺项；演练评估提交后会同步到这里</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <footer class="page-foot">
-      <span>共 {{ total }} 条机坪安全巡查记录</span>
+      <span>共 {{ total }} 条机坪安全巡查记录 · {{ sharedDeficiencies.length }} 条演练缺项</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
@@ -79,25 +128,43 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/local-service'
+import { advanceDeficiency, listDeficiencies } from '@/api/drill-service'
+import type { Deficiency, RectifyStatus } from '@/data/drill-types'
 import type { EntryRow } from '@/data/types'
 
 const meta = moduleMeta('apron')
 const columns = ["巡查编号", "巡查区域", "巡查人员", "发现问题数", "整改单号", "巡查时间", "复查日期", "巡查状态"]
 const actions = ["开始巡查", "提交整改", "确认复查"]
 const statuses = ["待巡查", "巡查中", "待整改", "已复查"]
-const stats = [{"label": "今日巡查次数", "value": 0}, {"label": "巡查中记录", "value": 0}, {"label": "待整改问题", "value": 0}]
+const stats = ref([
+  { label: "今日巡查次数", value: 0 },
+  { label: "巡查中记录", value: 0 },
+  { label: "待整改问题", value: 0 },
+])
 
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+const sharedDeficiencies = ref<Deficiency[]>([])
+
 const statusSummary = computed(() =>
   statuses.map((status: string) => ({
     status,
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+// 巡查侧的「待整改问题」统计直接取同源缺项，保证两边数字一致。
+const rectifySummary = computed<Record<RectifyStatus, number>>(() => {
+  const summary: Record<RectifyStatus, number> = { 待整改: 0, 整改中: 0, 已复查: 0 }
+  for (const item of sharedDeficiencies.value) {
+    summary[item.status] += 1
+  }
+  stats.value[2].value = summary['待整改']
+  return summary
+})
 
 function resetFilters() {
   filters.value = {}
@@ -122,12 +189,24 @@ function runAction(action: string, row: EntryRow) {
   reload()
 }
 
+function advance(id: number) {
+  errorMessage.value = ''
+  const result = advanceDeficiency(id)
+  if (!result.ok) {
+    errorMessage.value = result.message
+    return
+  }
+  reload()
+}
+
 function reload() {
   errorMessage.value = ''
   try {
     const payload = listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    // 与应急演练页读同一份缺项数据
+    sharedDeficiencies.value = listDeficiencies()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '机坪安全巡查列表读取失败'
   }
